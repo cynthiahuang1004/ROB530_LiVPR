@@ -13,7 +13,8 @@ from matplotlib import pyplot as plt
 from MixVPR.dataloaders.HPointLocDataloader import HPointLocDataModule
 from MixVPR.models import helper
 from MixVPR.dataloaders import HPointLocDataset, HPointLocDataloader
-
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 # %BANNER_BEGIN%
 # ---------------------------------------------------------------------
 # %COPYRIGHT_BEGIN%
@@ -95,8 +96,9 @@ class VPRModel(pl.LightningModule):
                 loss_name='MultiSimilarityLoss', 
                 miner_name='MultiSimilarityMiner', 
                 miner_margin=0.1,
-                faiss_gpu=False, 
-                model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+                faiss_gpu=False,
+                vlm_model_id = 'dinov2_vitb14',
+                depth_model_id = "depth-anything/Depth-Anything-V2-Small-hf",
                  ):
         super().__init__()
         self.encoder_arch = backbone_arch
@@ -120,7 +122,7 @@ class VPRModel(pl.LightningModule):
         self.miner_margin = miner_margin    
 
         self.tf_vpr = T.Compose([
-            T.Resize((320, 320), interpolation=T.InterpolationMode.BILINEAR),
+            T.Resize((322, 322), interpolation=T.InterpolationMode.BILINEAR),
             #add a transform convert_img_type to float from uint8
             T.ConvertImageDtype(torch.float32),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
@@ -139,12 +141,15 @@ class VPRModel(pl.LightningModule):
         self.embed_size = 4096
         self.l2_search = faiss.IndexFlatL2(self.embed_size)
         self.faiss_index = faiss.IndexIDMap(self.l2_search)
-
-        # perfect inekf
-        # adjoint purpose
         
+        # DinoV2 extractor
+        out_channels = 256
+        self.dino = torch.hub.load('facebookresearch/dinov2', vlm_model_id)
+        self.dino.eval()
+        embed_dim = {'dinov2_vits14': 384, 'dinov2_vitb14': 768}[vlm_model_id]
+        self.proj = nn.Conv2d(embed_dim, out_channels, kernel_size=1)
 
-        self.depth_model = AutoModelForDepthEstimation.from_pretrained(model_id)
+        self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth_model_id)
         self.depth_encoder = self.depth_model.backbone
 
         # Reduce feature map from 384 channels to 256 channels
@@ -160,16 +165,19 @@ class VPRModel(pl.LightningModule):
         return hook
     
     # the forward pass of the lightning model
-    def forward(self, x, llm_x):
-        #create a for loop going through the batch dimension 
-        #in the for loop convert each image to a PIL image 
-        #then pass it through the llm model
-        #then concatenate the llm output with the backbone output
-        #then pass it through the aggregator
-        #return the output
-        
-        # llm_in  = torch.cat(llm_in )
-   
+    def forward(self, x):
+
+        # DinoV2 feature map
+        B, C, H, W = x.shape
+        h_patches = H // 14
+        w_patches = W // 14
+        with torch.no_grad():
+            patch_tokens = self.dino.forward_features(x)['x_norm_patchtokens']
+        feat_map = patch_tokens.permute(0, 2, 1).reshape(B, -1, h_patches, w_patches)
+        feat_map = self.proj(feat_map)
+    
+
+        # Depth feature map
         with torch.no_grad():
             encoder_output = self.depth_encoder(x)
 
@@ -178,7 +186,10 @@ class VPRModel(pl.LightningModule):
             # Reshape from [B, N, C] to [B, C, H, W]
             # N-1 to remove CLS token
             b, n, c = f.shape
+
+            # in case input images isn't square
             h = w = int((n - 1)**0.5)
+            assert h * w == n - 1
             
             # Remove CLS token (index 0), then permute to [B, C, N-1]
             feat_2d = f[:, 1:, :].transpose(1, 2).contiguous().reshape(b, c, h, w)
@@ -190,10 +201,11 @@ class VPRModel(pl.LightningModule):
         # Concatenate 4 stages along channel dimension -> [B, 1024, H, W]
         depth_feats = torch.cat(processed_maps, dim=1)
 
-        depth_feats = torch.nn.functional.interpolate(depth_feats, size=(20, 20), mode='bilinear', align_corners=False)
-
-        # cat dinov2 here
-        x = torch.cat([depth_feats], dim=1)
+        depth_feats = torch.nn.functional.interpolate(depth_feats, size=(23, 23), mode='bilinear', align_corners=False)
+        feat_map = torch.nn.functional.interpolate(feat_map, size=(23, 23), mode='bilinear', align_corners=False)
+        
+        # cat dinov2 feature and depth feature here
+        x = torch.cat([feat_map, depth_feats], dim=1)
         x = self.aggregator(x)
         return x
     
@@ -269,11 +281,10 @@ class VPRModel(pl.LightningModule):
         
         # reshape places and labels
         images = places.view(BS*N, ch, h, w)
-        llm_images = llm_places.flatten(0,1)
         labels = labels.view(-1)
 
         # Feed forward the batch to the model
-        descriptors = self(images, llm_images) # Here we are calling the method forward that we defined above
+        descriptors = self(images) # Here we are calling the method forward that we defined above
         loss = self.loss_function(descriptors, labels) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
@@ -282,14 +293,16 @@ class VPRModel(pl.LightningModule):
     # This is called at the end of eatch training epoch
     def training_epoch_end(self, training_step_outputs):
         # we empty the batch_acc list for next epoch
+        print("End of training !")
         self.batch_acc = []
 
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
+        print("Now is validating 2")
         places, llm_places, _ = batch
         # calculate descriptors
-        descriptors = self(places, llm_places)
+        descriptors = self(places)
         return descriptors.detach().cpu()
     
     def validation_epoch_end(self, val_step_outputs):
@@ -306,6 +319,8 @@ class VPRModel(pl.LightningModule):
         
         for i, (val_set_name, val_dataset) in enumerate(zip(dm.val_set_names, dm.val_datasets)):
             feats = torch.concat(val_step_outputs[i], dim=0)
+
+            print("Now is validating 1")
             
             if 'pitts' in val_set_name:
                 # split to ref and queries
@@ -352,20 +367,43 @@ class VPRModel(pl.LightningModule):
                                                 )
             
             retrieved_images = []
-            for i in query_indices[:5]:
+            for idx, i in enumerate(query_indices[:5]):  # idx是predictions的index，i是dataset的index
                 mini = [val_dataset[i]] 
-                for j in predictions[i][:5]:
-                    mini.append(val_dataset[j])
+                for j in predictions[idx][:5]:  # 用 idx 而不是 i
+                    mini.append(val_dataset[reference_indices[j]])  # j是reference的相對index，要轉回絕對index
                 retrieved_images.append(mini)
+
+            # retrieved_images = []
+            # for i in query_indices[:5]:
+            #     mini = [val_dataset[i]] 
+            #     for j in predictions[i][:5]:
+            #         mini.append(val_dataset[j])
+            #     retrieved_images.append(mini)
             
             #create a subplot of 5 rows and 6 columns 
             fig, ax = plt.subplots(5, 6, figsize=(20, 20))
             #plot the images in retrived_images in each subplot 
-            for i in range(5):
-                for j in range(6):
-                    ax[i, j].imshow(retrieved_images[i][j])
-                    ax[i, j].axis('off')
-            del r_list, q_list, feats, num_references, positives
+            retrieved_images = []
+            for idx, i in enumerate(query_indices[:5]):
+                item = val_dataset[i]
+                print(f"type: {type(item)}, ", end="")
+                if isinstance(item, (list, tuple)):
+                    print(f"len: {len(item)}, types: {[type(x) for x in item]}")
+                else:
+                    print(f"shape: {item.shape if hasattr(item, 'shape') else 'no shape'}")
+                break  # 只印一次就好
+                
+            save_dir = f'./LOGS/retrieved_images'
+            os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(f'{save_dir}/epoch_{self.current_epoch}_{val_set_name}.png',
+                        bbox_inches='tight', dpi=100)
+            plt.close(fig)
+            
+            # for i in range(5):
+            #     for j in range(6):
+            #         ax[i, j].imshow(retrieved_images[i][j])
+            #         ax[i, j].axis('off')
+            # del r_list, q_list, feats, num_references, positives
 
             self.log(f'{val_set_name}/R1', pitts_dict[1], prog_bar=False, logger=True)
             self.log(f'{val_set_name}/R5', pitts_dict[5], prog_bar=False, logger=True)
@@ -414,9 +452,9 @@ if __name__ == '__main__':
         #             'out_channels': 2048},
 
         agg_arch='MixVPR',
-        agg_config={'in_channels' : 2048+256, #change this to 1024 if no clip, but 2048 with clip 
-                'in_h' : 20,
-                'in_w' : 20,
+        agg_config={'in_channels' : 256+1024, #change this to 1024 if no clip, but 2048 with clip 
+                'in_h' : 23,
+                'in_w' : 23,
                 'out_channels' : 1024,
                 'mix_depth' : 4,
                 'mlp_ratio' : 1,
@@ -437,8 +475,7 @@ if __name__ == '__main__':
         loss_name='MultiSimilarityLoss',
         miner_name='MultiSimilarityMiner', # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
         miner_margin=0.1,
-        faiss_gpu=False, 
-        superpoint_weights='C:/Users/User/Desktop/ROB530/clip-slcd/MixVPR/weights/superpoint_v1.pth'# path to superpoint_v1.pth
+        faiss_gpu=False
     )
 
     #load model weights frm weight_path 
@@ -450,11 +487,10 @@ if __name__ == '__main__':
         min_img_per_place=2,
         shuffle_all=True, # shuffle all images or keep shuffling in-city only
         random_sample_from_each_place=True,
-        image_size=(320, 320),
+        image_size=(322, 322),
         num_workers=2,
         show_data_stats=True,
         val_set_names=[val_set], # pitts30k_val, pitts30k_test, msls_val
-        llm_transform = model.llm_preprocess
     )
     
     # model params saving using Pytorch Lightning

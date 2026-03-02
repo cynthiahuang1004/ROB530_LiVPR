@@ -28,7 +28,6 @@ class HPointLocDataset(Dataset):
         self.length = len(self.filenames)
         self.imgs_per_place = imgs_per_place
         self.transform = transform
-        self.llm_transform = llm_transform
         self.image_indices = [] #[01234567]
         self.place_count = [] #[00000001111111122222222]
         self.place_set = []
@@ -94,7 +93,7 @@ class HPointLocDataset(Dataset):
                 tmp2 = self.transform(tmp)
 
                 place_list.append(tmp2.unsqueeze(0))
-                llm_place.append(self.llm_transform(tmp).unsqueeze(0))
+                llm_place.append(self.transform(tmp).unsqueeze(0))
             llm_place = torch.cat(llm_place, dim=0)
             place = torch.cat(place_list, dim=0)
             place_file.close()
@@ -111,7 +110,7 @@ class HPointLocDataset(Dataset):
             image = place[little_index]
             tmp = T.ToPILImage()(image).convert('RGB')
             tmp2 = self.transform(tmp)
-            llm_img = self.llm_transform(tmp)
+            llm_img = self.transform(tmp)
             place_file.close()
             return tmp2, llm_img, -1
 
