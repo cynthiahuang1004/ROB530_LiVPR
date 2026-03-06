@@ -139,12 +139,20 @@ class VPRModel(pl.LightningModule):
         # flat_config.useFloat16 = True
         # flat_config.device = 0
         self.embed_size = 4096
+        self.validation_step_outputs = []
         self.l2_search = faiss.IndexFlatL2(self.embed_size)
         self.faiss_index = faiss.IndexIDMap(self.l2_search)
+
+        # resnet50 backbone
+        self.backbone = helper.get_backbone(backbone_arch, pretrained, layers_to_freeze, layers_to_crop)
         
         # DinoV2 extractor
         out_channels = 256
-        self.dino = torch.hub.load('facebookresearch/dinov2', vlm_model_id)
+        self.dino = torch.hub.load(
+            '/home/shared/.cache/torch/hub/facebookresearch_dinov2_main',
+            vlm_model_id,
+            source='local'
+        )        
         self.dino.eval()
         embed_dim = {'dinov2_vits14': 384, 'dinov2_vitb14': 768}[vlm_model_id]
         self.proj = nn.Conv2d(embed_dim, out_channels, kernel_size=1)
@@ -200,12 +208,14 @@ class VPRModel(pl.LightningModule):
 
         # Concatenate 4 stages along channel dimension -> [B, 1024, H, W]
         depth_feats = torch.cat(processed_maps, dim=1)
+        res_feats = self.backbone(x)
 
         depth_feats = torch.nn.functional.interpolate(depth_feats, size=(23, 23), mode='bilinear', align_corners=False)
         feat_map = torch.nn.functional.interpolate(feat_map, size=(23, 23), mode='bilinear', align_corners=False)
+        res_feats = torch.nn.functional.interpolate(res_feats, size=(23, 23), mode='bilinear', align_corners=False)
         
         # cat dinov2 feature and depth feature here
-        x = torch.cat([feat_map, depth_feats], dim=1)
+        x = torch.cat([feat_map, depth_feats, res_feats], dim=1)
         x = self.aggregator(x)
         return x
     
@@ -230,10 +240,8 @@ class VPRModel(pl.LightningModule):
         return [optimizer], [scheduler]
     
     # configure the optizer step, takes into account the warmup stage
-    def optimizer_step(self,  epoch, batch_idx,
-                        optimizer, optimizer_idx, optimizer_closure,
-                        on_tpu, using_native_amp, using_lbfgs):
-        # warm up lr
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
+    # warm up lr
         if self.trainer.global_step < self.warmpup_steps:
             lr_scale = min(1., float(self.trainer.global_step + 1) / self.warmpup_steps)
             for pg in optimizer.param_groups:
@@ -291,7 +299,7 @@ class VPRModel(pl.LightningModule):
         return {'loss': loss}
     
     # This is called at the end of eatch training epoch
-    def training_epoch_end(self, training_step_outputs):
+    def on_train_epoch_end(self):
         # we empty the batch_acc list for next epoch
         print("End of training !")
         self.batch_acc = []
@@ -299,18 +307,20 @@ class VPRModel(pl.LightningModule):
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
-        print("Now is validating 2")
+        #print("Now is validating 2")
         places, llm_places, _ = batch
-        # calculate descriptors
         descriptors = self(places)
-        return descriptors.detach().cpu()
+        output = descriptors.detach().cpu()
+        self.validation_step_outputs.append(output)
+        return output
     
-    def validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_end(self):
         """this return descriptors in their order
         depending on how the validation dataset is implemented 
         for this project (MSLS val, Pittburg val), it is always references then queries
         [R1, R2, ..., Rn, Q1, Q2, ...]
         """
+        val_step_outputs = self.validation_step_outputs
         dm = self.trainer.datamodule
         # The following line is a hack: if we have only one validation set, then
         # we need to put the outputs in a list (Pytorch Lightning does not do it presently)
@@ -409,10 +419,11 @@ class VPRModel(pl.LightningModule):
             self.log(f'{val_set_name}/R5', pitts_dict[5], prog_bar=False, logger=True)
             self.log(f'{val_set_name}/R10', pitts_dict[10], prog_bar=False, logger=True)
         print('\n\n')
+        self.validation_step_outputs = []
             
             
 if __name__ == '__main__':
-    pl.utilities.seed.seed_everything(seed=190223, workers=True)
+    pl.seed_everything(seed=190223, workers=True)
         
     # datamodule = GSVCitiesDataModule(
     #     batch_size=32,
@@ -452,7 +463,7 @@ if __name__ == '__main__':
         #             'out_channels': 2048},
 
         agg_arch='MixVPR',
-        agg_config={'in_channels' : 256+1024, #change this to 1024 if no clip, but 2048 with clip 
+        agg_config={'in_channels' : 256 + 1024 + 1024, #256 (DinoV2) + 1024 (Depth) + 1024 (ResNet50) = 2304 
                 'in_h' : 23,
                 'in_w' : 23,
                 'out_channels' : 1024,
@@ -507,12 +518,12 @@ if __name__ == '__main__':
     #------------------
     # we instanciate a trainer
     trainer = pl.Trainer(
-        accelerator='cuda', gpus=1,
+        accelerator='cuda', devices=1,
         default_root_dir=f'./LOGS/{model.encoder_arch}', # Tensorflow can be used to viz 
 
         num_sanity_val_steps=0, # runs a validation step before stating training
         precision=16, # we use half precision to reduce  memory usage
-        max_epochs=80,
+        max_epochs=150,
         check_val_every_n_epoch=1, # run validation every epoch
         callbacks=[checkpoint_cb],# we only run the checkpointing callback (you can add more)
         reload_dataloaders_every_n_epochs=1, # we reload the dataset to shuffle the order

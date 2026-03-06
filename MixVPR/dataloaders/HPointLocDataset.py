@@ -11,20 +11,20 @@ import matplotlib.pyplot as plt
 import glob 
 from torch.utils.data import Dataset, DataLoader
 
-HARDCODE_PATH = 'C:/Users/User/Desktop/ROB530/clip-slcd/MixVPR/dataloaders/dataset'
-# HARDCODE_PATH = '/scratch/kskin_root/kskin1/advaiths/HPointLoc'
+path = "/media/hdd/ihsuan/ClipVPR/livpr/MixVPR/dataloaders/dataset/train/**/*.hdf5"
+HARDCODE_PATH = '/media/hdd/ihsuan/ClipVPR/HPointLoc'
 
 class HPointLocDataset(Dataset):
     def __init__(self, data_folder=HARDCODE_PATH, transform=None, llm_transform=None, imgs_per_place=10, split='train'):
         self.data_folder = data_folder
         self.split = split
         search_pattern = f"{self.data_folder}/{self.split}/**/*.hdf5"
-        print(search_pattern)
+        # print(search_pattern)
         # self.filenames = list(glob.glob(os.path.join(self.data_folder,self.split, '*','*.hdf5'), recursive=True))
         self.filenames = list(glob.glob(search_pattern, recursive=True))
-        print("                   ")
-        print("This is filename: ", self.filenames)
-        print("                   ")
+        # print("                   ")
+        # print("This is filename: ", self.filenames)
+        # print("                   ")
         self.length = len(self.filenames)
         self.imgs_per_place = imgs_per_place
         self.transform = transform
