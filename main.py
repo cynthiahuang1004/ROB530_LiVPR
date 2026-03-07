@@ -147,6 +147,10 @@ class VPRModel(pl.LightningModule):
         # resnet50 backbone
         self.backbone = helper.get_backbone(backbone_arch, pretrained, layers_to_freeze, layers_to_crop)
         
+
+        # resnet50 backbone
+        self.backbone = helper.get_backbone(backbone_arch, pretrained, layers_to_freeze, layers_to_crop)
+        
         # DinoV2 extractor
         out_channels = 256
         self.dino = torch.hub.load(
@@ -209,13 +213,16 @@ class VPRModel(pl.LightningModule):
 
         # Concatenate 4 stages along channel dimension -> [B, 1024, H, W]
         depth_feats = torch.cat(processed_maps, dim=1)
+        res_feats = self.backbone(x) # 1024 channels inside res_feats
         res_feats = self.backbone(x)
 
         depth_feats = torch.nn.functional.interpolate(depth_feats, size=(23, 23), mode='bilinear', align_corners=False)
         feat_map = torch.nn.functional.interpolate(feat_map, size=(23, 23), mode='bilinear', align_corners=False)
         res_feats = torch.nn.functional.interpolate(res_feats, size=(23, 23), mode='bilinear', align_corners=False)
+        res_feats = torch.nn.functional.interpolate(res_feats, size=(23, 23), mode='bilinear', align_corners=False)
         
         # cat dinov2 feature and depth feature here
+        x = torch.cat([feat_map, depth_feats, res_feats], dim=1)
         x = torch.cat([feat_map, depth_feats, res_feats], dim=1)
         x = self.aggregator(x)
         return x
@@ -312,9 +319,17 @@ class VPRModel(pl.LightningModule):
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
+        print("Now is validating 2")
+        places, llm_places, labels = batch
+        # calculate descriptors
         #print("Now is validating 2")
         places, llm_places, _ = batch
         descriptors = self(places)
+        val_loss = self.loss_function(descriptors, labels)
+        print("         ")
+        print("This is val loss !!", val_loss)
+        print("         ")
+        return descriptors.detach().cpu()
         output = descriptors.detach().cpu()
         self.validation_step_outputs.append(output)
         return output
@@ -470,6 +485,7 @@ if __name__ == '__main__':
         #             'out_channels': 2048},
 
         agg_arch='MixVPR',
+        agg_config={'in_channels' : 256+1024+1024, #change this to 1024 if no clip, but 2048 with clip 
         agg_config={'in_channels' : 256 + 1024 + 1024, #256 (DinoV2) + 1024 (Depth) + 1024 (ResNet50) = 2304 
                 'in_h' : 23,
                 'in_w' : 23,
