@@ -366,12 +366,12 @@ class VPRModel(pl.LightningModule):
                 r_list = feats[reference_indices]
                 q_list = feats[query_indices]
 
-                print("len(reference_indices):", len(reference_indices))
-                print("len(query_indices):", len(query_indices))
-                print("positives[0]:", positives[0])
-                print("new_positives[0]:", new_positives[0])
-                print("positives[1]:", positives[1])
-                print("new_positives[1]:", new_positives[1])
+                # print("len(reference_indices):", len(reference_indices))
+                # print("len(query_indices):", len(query_indices))
+                # print("positives[0]:", positives[0])
+                # print("new_positives[0]:", new_positives[0])
+                # print("positives[1]:", positives[1])
+                # print("new_positives[1]:", new_positives[1])
                 # new_positives = np.concatenate(new_positives)
 
             else:
