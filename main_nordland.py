@@ -319,17 +319,9 @@ class VPRModel(pl.LightningModule):
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
-        print("Now is validating 2")
         places, llm_places, labels = batch
-        # calculate descriptors
-        #print("Now is validating 2")
-        places, llm_places, _ = batch
         descriptors = self(places)
         val_loss = self.loss_function(descriptors, labels)
-        print("         ")
-        print("This is val loss !!", val_loss)
-        print("         ")
-        return descriptors.detach().cpu()
         output = descriptors.detach().cpu()
         self.validation_step_outputs.append(output)
         return output
@@ -350,7 +342,7 @@ class VPRModel(pl.LightningModule):
         for i, (val_set_name, val_dataset) in enumerate(zip(dm.val_set_names, dm.val_datasets)):
             feats = torch.concat(val_step_outputs[i], dim=0)
 
-            print("Now is validating 1")
+            #print("Now is validating 1")
             
             if 'pitts' in val_set_name:
                 # split to ref and queries
