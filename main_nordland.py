@@ -374,11 +374,13 @@ class VPRModel(pl.LightningModule):
                 q_list = feats[query_indices]
 
             elif 'nordland' in val_set_name:
-                num_references = val_dataset.num_references   # = num_frames
-                positives = val_dataset.positives             # positives[i] = [i]
+                num_references = val_dataset.num_references   
+                positives = val_dataset.positives           
                 r_list = feats[:num_references]               # 前半 = summer
                 q_list = feats[num_references:]               # 後半 = winter
-                new_positives = positives                     # 直接用，格式已符合
+                new_positives = positives                   
+                query_indices = list(range(num_references))      
+                reference_indices = list(range(num_references))
 
 
             else:
@@ -397,7 +399,7 @@ class VPRModel(pl.LightningModule):
             
             retrieved_images = []
             for idx, i in enumerate(query_indices[:5]):
-                mini = [val_dataset[i]]
+                mini = [val_dataset[i + num_references]]
                 for j in predictions[idx][:5]:
                     mini.append(val_dataset[reference_indices[j]])
                 retrieved_images.append(mini)
@@ -439,20 +441,6 @@ class VPRModel(pl.LightningModule):
 if __name__ == '__main__':
     pl.seed_everything(seed=190223, workers=True)
         
-    # datamodule = GSVCitiesDataModule(
-    #     batch_size=32,
-    #     img_per_place=2,
-    #     min_img_per_place=2,
-    #     shuffle_all=False, # shuffle all images or keep shuffling in-city only
-    #     random_sample_from_each_place=True,
-    #     image_size=(320, 320),
-    #     num_workers=28,
-    #     show_data_stats=True,
-    #     val_set_names=['pitts30k_val'], # pitts30k_val, pitts30k_test, msls_val
-    # )
-
-    
-    
     # examples of backbones
     # resnet18, resnet50, resnet101, resnet152,
     # resnext50_32x4d, resnext50_32x4d_swsl , resnext101_32x4d_swsl, resnext101_32x8d_swsl
@@ -465,16 +453,6 @@ if __name__ == '__main__':
         layers_to_freeze=2,
         layers_to_crop=[4], # 4 crops the last resnet layer, 3 crops the 3rd, ...etc
         
-        #---- Aggregator
-        # agg_arch='CosPlace',
-        # agg_config={'in_dim': 2048,
-        #             'out_dim': 2048},
-        # agg_arch='GeM',
-        # agg_config={'p': 3},
-        
-        # agg_arch='ConvAP',
-        # agg_config={'in_channels': 2048,
-        #             'out_channels': 2048},
 
         agg_arch='MixVPR',
         agg_config={'in_channels' : 256 + 1024 + 1024, #256 (DinoV2) + 1024 (Depth) + 1024 (ResNet50) = 2304 
