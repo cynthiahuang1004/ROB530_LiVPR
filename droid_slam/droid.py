@@ -132,7 +132,7 @@ class Droid:
             # G.add_nodes_from([t])
         self.loop_candidates[i] = []
         if i > 0:
-            D, I = self.clipvpr_encoder.faiss_index.search(im_feat.cpu().detach().numpy(), 3)
+            D, I = self.clipvpr_encoder.faiss_index.search(im_feat.cpu().detach().numpy(), 3) # Only returns top3 places with highest similarity
             # print(f"Distance: {D}\nIndices: {I}")
 
             #TODO: need to add a check for the actual distance between features 

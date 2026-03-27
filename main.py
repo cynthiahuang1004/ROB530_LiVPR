@@ -7,7 +7,8 @@ import MixVPR.utils as utils
 import torchvision.transforms as T
 import clip
 import faiss
-from matplotlib import pyplot as plt 
+from matplotlib import pyplot as plt
+from MixVPR.dataloaders.KITTI_dataloader import KITTIValidationModule
 
 # from MixVPR.dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
 from MixVPR.dataloaders.HPointLocDataloader import HPointLocDataModule
@@ -171,9 +172,22 @@ class VPRModel(pl.LightningModule):
     def forward(self, x):
 
         # DinoV2 feature map
-        B, C, H, W = x.shape
-        h_patches = H // 14
-        w_patches = W // 14
+        if x.dim() == 5:
+            B, S, C, H, W = x.shape
+            x = x.view(B * S, C, H, W) 
+        else:
+            B, C, H, W = x.shape
+            S = 1 # 紀錄序列長度為 1
+
+        # --- 新增：強制調整大小以符合 DINOv2 (14的倍數) ---
+        h_new = (H // 14) * 14
+        w_new = (W // 14) * 14
+        if H != h_new or W != w_new:
+            import torch.nn.functional as F
+            x = F.interpolate(x, size=(h_new, w_new), mode='bilinear', align_corners=False)
+        
+        h_patches = h_new // 14
+        w_patches = w_new // 14
         with torch.no_grad():
             patch_tokens = self.dino.forward_features(x)['x_norm_patchtokens']
         feat_map = patch_tokens.permute(0, 2, 1).reshape(B, -1, h_patches, w_patches)
@@ -191,7 +205,10 @@ class VPRModel(pl.LightningModule):
             b, n, c = f.shape
 
             # in case input images isn't square
-            h = w = int((n - 1)**0.5)
+            # h = w = int((n - 1)**0.5)
+            # assert h * w == n - 1
+            h = h_patches
+            w = w_patches
             assert h * w == n - 1
             
             # Remove CLS token (index 0), then permute to [B, C, N-1]
@@ -308,7 +325,8 @@ class VPRModel(pl.LightningModule):
         places, llm_places, labels = batch
         # calculate descriptors
         descriptors = self(places)
-        val_loss = self.loss_function(descriptors, labels)
+        # 將 labels 轉為 1D tensor: (batch_size,)
+        val_loss = self.loss_function(descriptors, labels.view(-1))
         print("         ")
         print("This is val loss !!", val_loss)
         print("         ")
@@ -349,7 +367,8 @@ class VPRModel(pl.LightningModule):
                 #blah blah blah
                 num_references = val_dataset.references.shape[0]
                 reference_indices = val_dataset.references 
-                query_indices = val_dataset.queries 
+                query_indices = val_dataset.queries
+                num_queries = len(query_indices)
                 positives = val_dataset.positives #should be np array of arrays 
                 # [[...] * num_q]
                 offset = 0
@@ -360,11 +379,46 @@ class VPRModel(pl.LightningModule):
                 r_list = feats[reference_indices]
                 q_list = feats[query_indices]
                 # new_positives = np.concatenate(new_positives)
+            elif 'KITTI' in val_set_name:
+                # KITTI 通常是 Self-Retrieval (自己找自己) 或序列對齊
+                # 這裡假設所有影像既是 Reference 也是 Query
+                num_total = len(val_dataset)
+                all_indices = np.arange(num_total)
+                
+                # 定義 Reference 和 Query (通常 KITTI 驗證會用同一組特徵進行 All-to-All 檢索)
+                reference_indices = all_indices
+                query_indices = all_indices
+                num_references = len(reference_indices)
+                num_queries = len(query_indices)
+
+                # 取得 Ground Truth (positives)
+                # 假設 KITTIVPRDataset 有實作 get_positives() 或是 positives 屬性
+                # 這通常是根據距離門檻 (如 5m) 預先算好的鄰居索引列表
+                if hasattr(val_dataset, 'positives'):
+                    new_positives = val_dataset.all_positives
+                else:
+                    # 如果 Dataset 沒寫，這裡會根據你提供的 threshold 現場算 (較慢)
+                    # 建議確保 Dataset 類別裡有 self.positives
+                    new_positives = val_dataset.all_positives
+
+                r_list = feats[reference_indices]
+                q_list = feats[query_indices]
 
             else:
                 print(f'Please implement validation_epoch_end for {val_set_name}')
                 raise NotImplemented
 
+            if 'KITTI' in val_set_name:
+                exclusion_radius = 25  # 排除前後 2.5 秒內的影像
+                filtered_positives = []
+                for i, pos_list in enumerate(new_positives):
+                    # 只保留索引差距大於 25 的正樣本
+                    mask = np.abs(pos_list - i) > exclusion_radius
+                    filtered_pos = pos_list[mask]
+                    filtered_positives.append(filtered_pos)
+                
+                # 替換掉原本的 gt
+                new_positives = filtered_positives
             
             pitts_dict, predictions = utils.get_validation_recalls(r_list=r_list, 
                                                 q_list=q_list,
@@ -375,44 +429,115 @@ class VPRModel(pl.LightningModule):
                                                 faiss_gpu=self.faiss_gpu
                                                 )
             
+            print("This is num_queries :", num_queries)
             retrieved_images = []
-            for idx, i in enumerate(query_indices[:5]):  # idx是predictions的index，i是dataset的index
-                mini = [val_dataset[i]] 
-                for j in predictions[idx][:5]:  # 用 idx 而不是 i
-                    mini.append(val_dataset[reference_indices[j]])  # j是reference的相對index，要轉回絕對index
+            num_viz_rows = min(num_queries, 10) # 準備前 10 組資料
+            exclusion_radius = 25 # KITTI 的排除半徑
+
+            for idx in range(num_viz_rows):
+                q_dataset_idx = query_indices[idx]
+                
+                # 第一張永遠是 Query
+                # 使用安全索引 [0] 解決 ValueError: too many values to unpack
+                query_img = val_dataset[q_dataset_idx][0] 
+                mini = [query_img] 
+                
+                # 尋找前 5 個「非鄰居」的 Rank 結果
+                count = 0
+                for rel_idx in predictions[idx]:
+                    if np.abs(rel_idx - idx) > exclusion_radius:
+                        ref_dataset_idx = int(reference_indices[rel_idx])
+                        mini.append(val_dataset[ref_dataset_idx][0])
+                        count += 1
+                    if count >= 5: # 找夠 5 張就停
+                        break
+                
                 retrieved_images.append(mini)
 
-            # retrieved_images = []
-            # for i in query_indices[:5]:
-            #     mini = [val_dataset[i]] 
-            #     for j in predictions[i][:5]:
-            #         mini.append(val_dataset[j])
-            #     retrieved_images.append(mini)
-            
-            #create a subplot of 5 rows and 6 columns 
-            fig, ax = plt.subplots(5, 6, figsize=(20, 20))
-            #plot the images in retrived_images in each subplot 
-            retrieved_images = []
-            for idx, i in enumerate(query_indices[:5]):
-                item = val_dataset[i]
-                print(f"type: {type(item)}, ", end="")
-                if isinstance(item, (list, tuple)):
-                    print(f"len: {len(item)}, types: {[type(x) for x in item]}")
-                else:
-                    print(f"shape: {item.shape if hasattr(item, 'shape') else 'no shape'}")
-                break  # 只印一次就好
-                
-            save_dir = f'./LOGS/retrieved_images'
+            # --- 開始繪圖 ---
+            num_viz = min(num_queries, 3)
+            top_k_viz = 2 # 畫兩張 Rank
+            fig, ax = plt.subplots(num_viz, 1 + top_k_viz, figsize=(15, 3 * num_viz))
+            if num_viz == 1: ax = np.expand_dims(ax, axis=0) 
+
+            for r in range(num_viz):
+                for c in range(1 + top_k_viz):
+                    # 安全檢查：如果這組 Query 找出來的 valid 圖片不夠多
+                    if c >= len(retrieved_images[r]):
+                        ax[r, c].text(0.5, 0.5, "No Loop Found", ha='center', va='center')
+                        ax[r, c].axis('off')
+                        continue
+                        
+                    img_data = retrieved_images[r][c]
+                    
+                    # 處理 Tensor 與格式轉換 (維持你原本的邏輯)
+                    if torch.is_tensor(img_data):
+                        if img_data.dim() == 4: img_data = img_data.squeeze(0)
+                        img_data = img_data.permute(1, 2, 0).cpu().numpy()
+                        img_data = (img_data * [0.229, 0.224, 0.225]) + [0.485, 0.456, 0.406]
+                        img_data = np.clip(img_data, 0, 1)
+
+                    ax[r, c].imshow(np.ascontiguousarray(img_data))
+                    ax[r, c].axis('off')
+
+                    # 設定標題
+                    if c == 0:
+                        ax[r, c].set_title(f"Query ID:{query_indices[r]}", fontsize=8)
+                    else:
+                        # 重新計算正確的 ID 用於標題
+                        valid_ranks = [j for j in predictions[r] if np.abs(j - r) > exclusion_radius]
+                        rel_idx = valid_ranks[c-1]
+                        abs_id = int(reference_indices[rel_idx])
+                        ax[r, c].set_title(f"Rank {c} ID:{abs_id} (Loop)", fontsize=8)
+
+            # --- 存檔 ---
+            save_dir = './LOGS/retrieved_images'
             os.makedirs(save_dir, exist_ok=True)
-            plt.savefig(f'{save_dir}/epoch_{self.current_epoch}_{val_set_name}.png',
-                        bbox_inches='tight', dpi=100)
+            plt.savefig(f'{save_dir}/epoch_{self.current_epoch}_{val_set_name}.png', bbox_inches='tight', dpi=100)
             plt.close(fig)
+
+            print(f"\n" + "="*50)
+            print(f"Epoch {self.current_epoch} - {val_set_name}")
+            print("-" * 50)
             
-            # for i in range(5):
-            #     for j in range(6):
-            #         ax[i, j].imshow(retrieved_images[i][j])
-            #         ax[i, j].axis('off')
-            # del r_list, q_list, feats, num_references, positives
+            num_viz_print = min(num_queries, 3)
+            for r in range(num_viz_print):
+                q_idx = query_indices[r]
+                
+                # 關鍵：找出這組 Query 的「非鄰居」預測列表
+                valid_preds = [j for j in predictions[r] if np.abs(j - r) > exclusion_radius]
+                
+                # 取得 Rank 1 & 2 (如果有的話)
+                top1_abs = int(reference_indices[valid_preds[0]]) if len(valid_preds) > 0 else "N/A"
+                top2_abs = int(reference_indices[valid_preds[1]]) if len(valid_preds) > 1 else "N/A"
+                
+                print(f"Query {r} (ID: {q_idx}) -> Rank 1: {top1_abs} (Loop), Rank 2: {top2_abs}")
+            print("="*50 + "\n")
+            import json
+
+            def convert_to_serializable(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, (np.int32, np.int64)):
+                    return int(obj)
+                if isinstance(obj, (np.float32, np.float64)):
+                    return float(obj)
+                return obj
+
+            predictions_abs = [[int(reference_indices[rel_idx]) for rel_idx in row] for row in predictions]
+
+            loop_data = {
+                "val_set_name": val_set_name,
+                "epoch": self.current_epoch,
+                "query_indices": query_indices.tolist() if hasattr(query_indices, 'tolist') else list(query_indices),
+                "top_k_predictions": predictions_abs
+            }
+
+            json_save_path = f'{save_dir}/indices_epoch_{self.current_epoch}_{val_set_name}.json'
+            with open(json_save_path, 'w') as f:
+                json.dump(loop_data, f, indent=4, default=convert_to_serializable)
+
+            print(f">>> 已將 Index 對應關係存至: {json_save_path}")
 
             self.log(f'{val_set_name}/R1', pitts_dict[1], prog_bar=False, logger=True)
             self.log(f'{val_set_name}/R5', pitts_dict[5], prog_bar=False, logger=True)
@@ -489,17 +614,32 @@ if __name__ == '__main__':
 
     #load model weights frm weight_path 
     # model.load_from_checkpoint('')# path to resnet checkpoint
-    val_set = 'hloc'
-    datamodule = HPointLocDataModule(
-        batch_size=32,
-        img_per_place=2,
-        min_img_per_place=2,
-        shuffle_all=True, # shuffle all images or keep shuffling in-city only
-        random_sample_from_each_place=True,
-        image_size=(322, 322),
-        num_workers=2,
-        show_data_stats=True,
-        val_set_names=[val_set], # pitts30k_val, pitts30k_test, msls_val
+    # val_set = 'hloc'
+    # datamodule = HPointLocDataModule(
+    #     batch_size=32,
+    #     img_per_place=2,
+    #     min_img_per_place=2,
+    #     shuffle_all=True, # shuffle all images or keep shuffling in-city only
+    #     random_sample_from_each_place=True,
+    #     image_size=(322, 322),
+    #     num_workers=2,
+    #     show_data_stats=True,
+    #     val_set_names=[val_set], # pitts30k_val, pitts30k_test, msls_val
+    # )
+    
+    val_set = 'kitti'
+    val_sequences = ['00'] 
+
+    datamodule = KITTIValidationModule(
+        data_folder='C:/Users/User/Desktop/ROB530/clip-slcd/MixVPR/dataloaders/KITTI_dataset',
+        batch_size=32,            # 根據你的顯存大小調整，驗證通常可以設大一點
+        image_size=(480, 640),    # KITTI 原始比例接近 3:10，這裡建議維持 480x640 或 320x640
+        num_workers=4,            # 建議設為 CPU 核心數的一半
+        val_seqs=val_sequences,   # 傳入你想驗證的序列清單
+        mean_std={
+            'mean': [0.485, 0.456, 0.406], 
+            'std': [0.229, 0.224, 0.225]
+        } # 使用 ImageNet 標準歸一化
     )
     
     # model params saving using Pytorch Lightning
@@ -530,5 +670,5 @@ if __name__ == '__main__':
     )
 
     # we call the trainer, we give it the model and the datamodule
-    trainer.fit(model=model, datamodule=datamodule)
-    # trainer.validate(model=model, datamodule=datamodule)
+    # trainer.fit(model=model, datamodule=datamodule)
+    trainer.validate(model=model, datamodule=datamodule)
