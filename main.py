@@ -169,7 +169,8 @@ class VPRModel(pl.LightningModule):
         return hook
     
     # the forward pass of the lightning model
-    def forward(self, x):
+    def forward(self, x, is_visualizing=False):
+        grad_context = torch.enable_grad() if is_visualizing else torch.no_grad()
 
         # DinoV2 feature map
         if x.dim() == 5:
@@ -188,14 +189,22 @@ class VPRModel(pl.LightningModule):
         
         h_patches = h_new // 14
         w_patches = w_new // 14
-        with torch.no_grad():
+
+        with grad_context:
             patch_tokens = self.dino.forward_features(x)['x_norm_patchtokens']
+
+        # with torch.no_grad():
+        #     patch_tokens = self.dino.forward_features(x)['x_norm_patchtokens']
+
         feat_map = patch_tokens.permute(0, 2, 1).reshape(B, -1, h_patches, w_patches)
         feat_map = self.proj(feat_map)
     
 
         # Depth feature map
-        with torch.no_grad():
+        # with torch.no_grad():
+        #     encoder_output = self.depth_encoder(x)
+
+        with grad_context:
             encoder_output = self.depth_encoder(x)
 
         processed_maps = []
@@ -220,7 +229,10 @@ class VPRModel(pl.LightningModule):
 
         # Concatenate 4 stages along channel dimension -> [B, 1024, H, W]
         depth_feats = torch.cat(processed_maps, dim=1)
-        res_feats = self.backbone(x) # 1024 channels inside res_feats
+        
+        # res_feats = self.backbone(x) # 1024 channels inside res_feats
+        with grad_context:
+            res_feats = self.backbone(x)
 
         depth_feats = torch.nn.functional.interpolate(depth_feats, size=(23, 23), mode='bilinear', align_corners=False)
         feat_map = torch.nn.functional.interpolate(feat_map, size=(23, 23), mode='bilinear', align_corners=False)
@@ -330,6 +342,9 @@ class VPRModel(pl.LightningModule):
         print("         ")
         print("This is val loss !!", val_loss)
         print("         ")
+
+        self.last_batch = batch # keep the last batch for visualization
+
         return descriptors.detach().cpu()
     
     def validation_epoch_end(self, val_step_outputs):
@@ -543,6 +558,89 @@ class VPRModel(pl.LightningModule):
             self.log(f'{val_set_name}/R5', pitts_dict[5], prog_bar=False, logger=True)
             self.log(f'{val_set_name}/R10', pitts_dict[10], prog_bar=False, logger=True)
         print('\n\n')
+
+        if hasattr(self, 'last_batch'):
+            print(f"Generating contribution visualization for epoch {self.current_epoch}...")
+            save_path = f'./LOGS/retrieved_images/interpret_epoch_{self.current_epoch}.png'
+            
+            # 注意：你的 visualize_contribution 定義在類別內，呼叫時要用 self
+            try:
+                self.visualize_contribution(self.last_batch, save_name=save_path)
+                print(f">>> 視覺化圖表已存至: {save_path}")
+            except Exception as e:
+                print(f"視覺化失敗: {e}")
+    
+    def visualize_contribution(self, batch, save_name="interpret.png"):
+        self.eval()
+        
+        places, _, labels = batch
+        img = places[0:1].clone().detach().to(self.device)
+        img.requires_grad = True 
+        
+        with torch.enable_grad():
+            descriptors = self(img, is_visualizing=True) 
+            
+            target = labels[0:1].view(-1).to(self.device)
+            loss = self.loss_fn(descriptors, target)
+            
+            self.zero_grad()
+            loss.backward()
+            
+        if img.grad is not None:
+            grad_data = img.grad.data.cpu().numpy()[0]
+            learned_weights = grad_data.mean(axis=0) 
+        else:
+            print("Error: Gradient is None. Make sure forward pass is differentiable.")
+            learned_weights = np.zeros((img.shape[2], img.shape[3]))
+
+        self.zero_grad()
+        
+        self._plot_results(img, learned_weights, save_name)
+
+    def _plot_results(self, img, weights, save_name):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import cv2
+        import torch
+
+        fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+        
+        rgb = img[0].detach().permute(1, 2, 0).cpu().numpy()
+        rgb = (rgb * [0.229, 0.224, 0.225]) + [0.485, 0.456, 0.406]
+        rgb = np.clip(rgb, 0, 1)
+        axes[0].imshow(rgb)
+        axes[0].set_title("Original RGB")
+
+        with torch.no_grad():
+            depth_feats = self.depth_encoder(img.detach()).feature_maps[-1]
+            if depth_feats.shape[1] == 530:
+                d_tokens = depth_feats[0, 1:, :].mean(dim=-1)
+            else:
+                d_tokens = depth_feats[0, :, :].mean(dim=-1)
+            d_map = d_tokens.reshape(23, 23).cpu().numpy()
+            d_map = cv2.resize(d_map, (rgb.shape[1], rgb.shape[0]))
+        axes[1].imshow(d_map, cmap='magma')
+        axes[1].set_title("Geometric (Depth) Feature")
+
+        with torch.no_grad():
+            dino_layers = self.dino.get_intermediate_layers(img.detach())
+            dino_out = dino_layers[-1]
+            if dino_out.shape[1] == 530:
+                s_tokens = dino_out[0, 1:, :].mean(dim=-1)
+            else:
+                s_tokens = dino_out[0, :, :].mean(dim=-1)
+            semantic_map = s_tokens.reshape(23, 23).cpu().numpy()
+            semantic_map = cv2.resize(semantic_map, (rgb.shape[1], rgb.shape[0]))
+        axes[2].imshow(semantic_map, cmap='viridis')
+        axes[2].set_title("Semantic (DINO) Feature")
+
+        v_limit = np.percentile(np.abs(weights), 99) if np.any(weights) else 1.0
+        axes[3].imshow(weights, cmap='RdBu_r', vmin=-v_limit, vmax=v_limit)
+        axes[3].set_title("Learned Weights (Gradients)")
+        
+        for ax in axes: ax.axis('off')
+        plt.savefig(save_name, bbox_inches='tight', dpi=150)
+        plt.close(fig)
             
             
 if __name__ == '__main__':
@@ -613,37 +711,41 @@ if __name__ == '__main__':
     )
 
     #load model weights frm weight_path 
+    # print("test-1")
     # model.load_from_checkpoint('')# path to resnet checkpoint
-    # val_set = 'hloc'
-    # datamodule = HPointLocDataModule(
-    #     batch_size=32,
-    #     img_per_place=2,
-    #     min_img_per_place=2,
-    #     shuffle_all=True, # shuffle all images or keep shuffling in-city only
-    #     random_sample_from_each_place=True,
-    #     image_size=(322, 322),
-    #     num_workers=2,
-    #     show_data_stats=True,
-    #     val_set_names=[val_set], # pitts30k_val, pitts30k_test, msls_val
-    # )
-    
-    val_set = 'kitti'
-    val_sequences = ['00'] 
-
-    datamodule = KITTIValidationModule(
-        data_folder='C:/Users/User/Desktop/ROB530/clip-slcd/MixVPR/dataloaders/KITTI_dataset',
-        batch_size=32,            # 根據你的顯存大小調整，驗證通常可以設大一點
-        image_size=(480, 640),    # KITTI 原始比例接近 3:10，這裡建議維持 480x640 或 320x640
-        num_workers=4,            # 建議設為 CPU 核心數的一半
-        val_seqs=val_sequences,   # 傳入你想驗證的序列清單
-        mean_std={
-            'mean': [0.485, 0.456, 0.406], 
-            'std': [0.229, 0.224, 0.225]
-        } # 使用 ImageNet 標準歸一化
+    print("test0")
+    val_set = 'hloc'
+    datamodule = HPointLocDataModule(
+        batch_size=32,
+        img_per_place=2,
+        min_img_per_place=2,
+        shuffle_all=True, # shuffle all images or keep shuffling in-city only
+        random_sample_from_each_place=True,
+        image_size=(322, 322),
+        num_workers=2,
+        show_data_stats=True,
+        val_set_names=[val_set], # pitts30k_val, pitts30k_test, msls_val
     )
+    
+    # val_set = 'kitti'
+    # val_sequences = ['00'] 
+
+    # datamodule = KITTIValidationModule(
+    #     data_folder='C:/Users/User/Desktop/ROB530/clip-slcd/MixVPR/dataloaders/KITTI_dataset',
+    #     batch_size=32,            # 根據你的顯存大小調整，驗證通常可以設大一點
+    #     image_size=(480, 640),    # KITTI 原始比例接近 3:10，這裡建議維持 480x640 或 320x640
+    #     num_workers=4,            # 建議設為 CPU 核心數的一半
+    #     val_seqs=val_sequences,   # 傳入你想驗證的序列清單
+    #     mean_std={
+    #         'mean': [0.485, 0.456, 0.406], 
+    #         'std': [0.229, 0.224, 0.225]
+    #     } # 使用 ImageNet 標準歸一化
+    # )
     
     # model params saving using Pytorch Lightning
     # we save the best 3 models accoring to Recall@1 on pittsburg val
+
+    print("test1")
     checkpoint_cb = ModelCheckpoint(
         monitor=f'{val_set}/R1',
         filename=f'{model.encoder_arch}' +
@@ -652,6 +754,8 @@ if __name__ == '__main__':
         save_weights_only=True,
         save_top_k=3,
         mode='max',)
+    
+    print("test2")
 
     #------------------
     # we instanciate a trainer
@@ -670,5 +774,5 @@ if __name__ == '__main__':
     )
 
     # we call the trainer, we give it the model and the datamodule
-    # trainer.fit(model=model, datamodule=datamodule)
-    trainer.validate(model=model, datamodule=datamodule)
+    trainer.fit(model=model, datamodule=datamodule)
+    # trainer.validate(model=model, datamodule=datamodule)
