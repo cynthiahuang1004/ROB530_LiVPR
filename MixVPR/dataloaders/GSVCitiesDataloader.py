@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 from torch.utils.data.dataloader import DataLoader
 from torchvision import transforms as T
 
-from dataloaders.GSVCitiesDataset import GSVCitiesDataset
+from MixVPR.dataloaders.GSVCitiesDataset import GSVCitiesDataset
 from . import PittsburgDataset
 # from . import MapillaryDataset
 
@@ -99,7 +99,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                         input_transform=self.valid_transform))
                 elif valid_set_name.lower() == 'pitts30k_val':
                     self.val_datasets.append(PittsburgDataset.get_whole_val_set(
-                        input_transform=self.valid_transform))
+                        input_transform=self.valid_transform)) 
                 elif valid_set_name.lower() == 'msls_val':
                     self.val_datasets.append(MapillaryDataset.MSLS(
                         input_transform=self.valid_transform))

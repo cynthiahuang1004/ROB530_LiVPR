@@ -233,7 +233,7 @@ if __name__ == '__main__':
 
 '''
 python eval_sold2.py \
-  --ckpt_dir /media/hdd/ihsuan/ClipVPR/livpr/LOGS/resnet50/lightning_logs/version_7/checkpoints \
+  --ckpt_dir /media/hdd/ihsuan/ClipVPR/livpr/LOGS/resnet50/lightning_logs/Final_ResNet_DepthAnythingV2_SOLD2/checkpoints \
   --datasets nordland pitts250k sped msls \
   --batch_size 64
 '''
