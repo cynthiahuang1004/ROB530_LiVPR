@@ -1,3 +1,4 @@
+<<<<<<< HEAD:main.py
 import pytorch_lightning as pl
 import torch
 import numpy as np
@@ -776,3 +777,6 @@ if __name__ == '__main__':
     # we call the trainer, we give it the model and the datamodule
     trainer.fit(model=model, datamodule=datamodule)
     # trainer.validate(model=model, datamodule=datamodule)
+=======
+
+>>>>>>> 20260418:main_GSV_sold2.py
