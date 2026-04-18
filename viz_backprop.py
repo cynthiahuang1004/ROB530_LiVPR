@@ -1,17 +1,7 @@
 '''
-backprop_viz.py
-用途：對訓練好的 VPRModel checkpoint 做 Grad-CAM 視覺化（三分支）
-支援：SPED / Pittsburgh250k / Nordland / MSLS
-
-Usage:
-    # 批次跑整個資料集
-    python viz_backprop.py --dataset sped
-
-    # 只跑單張
-    python viz_backprop.py --single_query path/to/query.jpg
-
-    # 控制張數 & 指定 GPU
-    python viz_backprop.py --dataset sped --max_samples 20 --gpu 1
+python viz_backprop.py --dataset sped
+python viz_backprop.py --single_query path/to/query.jpg
+python viz_backprop.py --dataset sped --max_samples 20 --gpu 1
 '''
 
 import os
@@ -29,18 +19,12 @@ import pandas as pd
 from sklearn.neighbors import BallTree
 from main_GSV import VPRModel
 
-# ===========================================================
-# Checkpoint 路徑
-# ===========================================================
 CKPT_PATH = (
     "/media/hdd/ihsuan/ClipVPR/livpr/LOGS/resnet50/lightning_logs/"
     "version_4/checkpoints/"
     "resnet50_epoch(06)_step(3290)_R1[0.9246]_R5[0.9815].ckpt"
 )
 
-# ===========================================================
-# 圖片前處理
-# ===========================================================
 transform = T.Compose([
     T.Resize((322, 322)),
     T.ToTensor(),
@@ -53,13 +37,9 @@ def load_image(path):
         img = Image.open(path).convert('RGB')
         return transform(img).unsqueeze(0).cuda()
     except Exception as e:
-        print(f"  [警告] 無法開啟圖片，跳過: {path} ({e})")
+        print(f"[Warning: cannot open image, skipping]: {path} ({e})")
         return None
 
-
-# ===========================================================
-# 圖片搜尋工具
-# ===========================================================
 def _glob_images(folder):
     folder = Path(folder)
     imgs = []
@@ -67,10 +47,6 @@ def _glob_images(folder):
         imgs.extend(folder.glob(ext))
     return sorted(imgs)
 
-
-# ===========================================================
-# 資料集 pair 建立
-# ===========================================================
 def get_dataset_pairs(dataset_name):
     """回傳 list of (query_path_str, ref_path_str)"""
 
@@ -124,7 +100,7 @@ def get_dataset_pairs(dataset_name):
             r_path = root / folder          / (fname  + '.jpg')
             pairs.append((str(q_path), str(r_path)))
 
-        print(f"[Pittsburgh] {len(pairs)} pairs, 跳過無GT: {skipped}")
+        print(f"[Pittsburgh] {len(pairs)} pairs, skipped GT: {skipped}")
         return pairs
 
     elif dataset_name == 'nordland':
@@ -135,10 +111,10 @@ def get_dataset_pairs(dataset_name):
         if filtered_txt.exists():
             with open(filtered_txt) as f:
                 valid_names = set(line.strip() for line in f)
-            print(f"[Nordland] filtered list: {len(valid_names)} 個有效幀")
+            print(f"[Nordland] filtered list: {len(valid_names)} frames available")
         else:
             valid_names = None
-            print("[Nordland] filtered list 不存在，改用亮度過濾")
+            print("[Nordland] filtered list does not exist, using brightness filtering")
 
         r_map   = {p.name: p for p in _glob_images(r_dir)}
         pairs, skipped = [], 0
@@ -155,7 +131,7 @@ def get_dataset_pairs(dataset_name):
                     continue
             pairs.append((str(q), str(r_map[q.name])))
 
-        print(f"[Nordland] {len(pairs)} valid pairs, 跳過: {skipped}")
+        print(f"[Nordland] {len(pairs)} valid pairs, skipped: {skipped}")
         return pairs
 
     elif dataset_name == 'msls':
@@ -205,26 +181,13 @@ def get_dataset_pairs(dataset_name):
             print(f'[MSLS/{city_name}] query={len(pq)}  matched={len(city_pairs)} ({matched_rate:.1f}%)')
             all_pairs.extend(city_pairs)
 
-        print(f'\n[MSLS] 全部城市合計: {len(all_pairs)} pairs')
+        print(f'\n[MSLS] Total pairs across all cities: {len(all_pairs)}')
         return all_pairs
 
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-
-# ===========================================================
-# Grad-CAM 視覺化（三分支）
-# ===========================================================
 def visualize_gradcam_all_branches(model, image_path, save_path='gradcam_all.png'):
-    """
-    對三個分支同時做 Grad-CAM（一次 forward+backward）：
-      DinoV2   → model.proj
-      Depth    → model.reducers[-1]
-      ResNet50 → model.backbone
-
-    輸出：3 列 × 3 欄（原圖 / heatmap / overlay）
-    回傳：dict {'DinoV2': cam_np, 'Depth': cam_np, 'ResNet50': cam_np}
-    """
     img_tensor = load_image(image_path)
     if img_tensor is None:
         return None
@@ -256,7 +219,6 @@ def visualize_gradcam_all_branches(model, image_path, save_path='gradcam_all.png
     for h in hooks:
         h.remove()
 
-    # 計算每個分支的 Grad-CAM
     cams = {}
     for name in ['DinoV2', 'Depth', 'ResNet50']:
         feat    = saved_feat[name].detach()
@@ -268,7 +230,6 @@ def visualize_gradcam_all_branches(model, image_path, save_path='gradcam_all.png
         cam     = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         cams[name] = cam
 
-    # 畫圖：3 列（分支）× 3 欄（原圖 / heatmap / overlay）
     orig_img = Image.open(image_path).convert('RGB').resize((322, 322))
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
 
@@ -287,10 +248,6 @@ def visualize_gradcam_all_branches(model, image_path, save_path='gradcam_all.png
     plt.close()
     return cams
 
-
-# ===========================================================
-# 批次處理
-# ===========================================================
 def batch_visualize(model, dataset_name, output_dir, max_samples):
     pairs   = get_dataset_pairs(dataset_name)[:max_samples]
     out_dir = Path(output_dir) / dataset_name / 'gradcam_all'
@@ -304,13 +261,10 @@ def batch_visualize(model, dataset_name, output_dir, max_samples):
             save_path=str(out_dir / f'{stem}_gradcam_all.png')
         )
 
-    print(f"\n=== 完成 [{dataset_name}] ===")
-    print(f"結果存在: {out_dir}/")
+    print(f"\n=== Completed [{dataset_name}] ===")
+    print(f"Result saved to {out_dir}/")
 
 
-# ===========================================================
-# Main
-# ===========================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset',      type=str, default='sped',
@@ -318,17 +272,17 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir',   type=str, default='./viz_results')
     parser.add_argument('--max_samples',  type=int, default=20)
     parser.add_argument('--single_query', type=str, default=None,
-                        help='只跑單張 query，不需指定 --dataset')
+                        help='Only run single query, don\'t specify --dataset')
     parser.add_argument('--gpu',          type=int, default=0)
     args = parser.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    print(f"使用 GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
+    print(f"Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
 
-    print(f"載入 checkpoint：{CKPT_PATH}")
+    print(f"Loading checkpoint：{CKPT_PATH}")
     model = VPRModel.load_from_checkpoint(CKPT_PATH)
     model.eval().cuda()
-    print("模型載入完成！\n")
+    print("Model loaded!\n")
 
     if args.single_query:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -336,6 +290,6 @@ if __name__ == '__main__':
             model, args.single_query,
             save_path=f'{args.output_dir}/single_gradcam_all.png'
         )
-        print(f"結果存在 {args.output_dir}/single_gradcam_all.png")
+        print(f"Result saved to {args.output_dir}/single_gradcam_all.png")
     else:
         batch_visualize(model, args.dataset, args.output_dir, args.max_samples)

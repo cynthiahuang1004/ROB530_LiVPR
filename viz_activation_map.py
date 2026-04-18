@@ -1,17 +1,7 @@
 '''
-viz_activation_map.py
-用途：對訓練好的 VPRModel checkpoint 做三分支 Activation Map 視覺化
-支援：SPED / Pittsburgh250k / Nordland / MSLS
-
-Usage:
-    # 批次跑資料集
-    python viz_activation_map.py --dataset sped
-
-    # 只跑單張
-    python viz_activation_map.py --single_query path/to/query.jpg
-
-    # 控制張數 & 指定 GPU
-    python viz_activation_map.py --dataset nordland --max_samples 20 --gpu 0
+python viz_activation_map.py --dataset sped
+python viz_activation_map.py --single_query path/to/query.jpg
+python viz_activation_map.py --dataset nordland --max_samples 20 --gpu 0
 '''
 
 import os
@@ -29,9 +19,7 @@ import pandas as pd
 from sklearn.neighbors import BallTree
 from main_GSV import VPRModel
 
-# ===========================================================
-# Checkpoint 路徑
-# ===========================================================
+
 CKPT_PATH = (
     "/media/hdd/ihsuan/ClipVPR/livpr/LOGS/resnet50/lightning_logs/Final_ResNet_DepthAnythingV2_SOLD2/checkpoints/resnet50_epoch(05)_step(2820)_R1[0.9303]_R5[0.9828].ckpt"
 )
@@ -43,9 +31,6 @@ msls: /media/hdd/ihsuan/ClipVPR/livpr/LOGS/resnet50/lightning_logs/Final_ResNet_
 sped: /media/hdd/ihsuan/ClipVPR/livpr/LOGS/resnet50/lightning_logs/Final_ResNet_DepthAnythingV2_SOLD2/checkpoints/resnet50_epoch(05)_step(2820)_R1[0.9303]_R5[0.9828].ckpt
 '''
 
-# ===========================================================
-# 圖片前處理
-# ===========================================================
 transform = T.Compose([
     T.Resize((322, 322)),
     T.ToTensor(),
@@ -58,13 +43,9 @@ def load_image(path):
         img = Image.open(path).convert('RGB')
         return transform(img).unsqueeze(0).cuda()
     except Exception as e:
-        print(f"  [警告] 無法開啟圖片，跳過: {path} ({e})")
+        print(f"Warning: Cannot open image, skipping: {path} ({e})")
         return None
 
-
-# ===========================================================
-# 圖片搜尋工具
-# ===========================================================
 def _glob_images(folder):
     folder = Path(folder)
     imgs = []
@@ -72,10 +53,6 @@ def _glob_images(folder):
         imgs.extend(folder.glob(ext))
     return sorted(imgs)
 
-
-# ===========================================================
-# 資料集 query 取得
-# ===========================================================
 def get_query_paths(dataset_name):
     if dataset_name == 'sped':
         q_dir  = Path('/media/hdd/ihsuan/ClipVPR/SPED/SPEDTEST/SPEDTEST/query')
@@ -108,10 +85,10 @@ def get_query_paths(dataset_name):
         if filtered_txt.exists():
             with open(filtered_txt) as f:
                 valid_names = set(line.strip() for line in f)
-            print(f"[Nordland] filtered list: {len(valid_names)} 個有效幀")
+            print(f"[Nordland] filtered list: {len(valid_names)} frames available")
         else:
             valid_names = None
-            print("[Nordland] filtered list 不存在，改用亮度過濾")
+            print("[Nordland] filtered list does not exist, using all frames (will skip very dark ones)")
         paths, skipped = [], 0
         for q in _glob_images(q_dir):
             if valid_names is not None:
@@ -123,7 +100,7 @@ def get_query_paths(dataset_name):
                     skipped += 1
                     continue
             paths.append(str(q))
-        print(f"[Nordland] {len(paths)} queries, 跳過: {skipped}")
+        print(f"[Nordland] {len(paths)} queries, skipped: {skipped}")
         return paths
 
     elif dataset_name == 'msls':
@@ -170,24 +147,11 @@ def get_query_paths(dataset_name):
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
-# ===========================================================
-# 三分支 Activation Map 視覺化
-# ===========================================================
-
 class _StopForward(Exception):
     """在 aggregator 之前中斷 forward，避免 channel shape mismatch"""
     pass
 
 def visualize_three_branches(model, image_path, save_path='branches.png'):
-    """
-    擷取三個分支的 channel-mean activation map：
-      ResNet50 → model.backbone       (1024ch)
-      DinoV2   → model.proj           (256ch)
-      SOLD2    → model.sold2_adapter  (256ch)
-
-    forward 在進入 aggregator 前用 _StopForward 中斷。
-    輸出：2 列 × 4 欄（第一欄原圖，後三欄各分支 heatmap / overlay）
-    """
     img_tensor = load_image(image_path)
     if img_tensor is None:
         return
@@ -213,13 +177,13 @@ def visualize_three_branches(model, image_path, save_path='branches.png'):
         with torch.no_grad():
             model(img_tensor)
     except _StopForward:
-        pass  # 正常中斷，三個分支 feature 已存好
+        pass  
     finally:
         for h in hooks:
             h.remove()
 
     if len(branch_feats) < 3:
-        print(f"  [警告] 只擷取到 {len(branch_feats)} 個分支，跳過: {image_path}")
+        print(f"Warning: Only extracted {len(branch_feats)} branches, skipping: {image_path}")
         return
 
     orig_img = Image.open(image_path).convert('RGB').resize((322, 322))
@@ -248,10 +212,6 @@ def visualize_three_branches(model, image_path, save_path='branches.png'):
     plt.savefig(save_path, dpi=120, bbox_inches='tight')
     plt.close()
 
-
-# ===========================================================
-# 批次處理
-# ===========================================================
 def batch_visualize(model, dataset_name, output_dir, max_samples):
     query_paths = get_query_paths(dataset_name)[:max_samples]
     out_dir     = Path(output_dir) / dataset_name / 'branches'
@@ -265,13 +225,9 @@ def batch_visualize(model, dataset_name, output_dir, max_samples):
             save_path=str(out_dir / f'{stem}_branches.png')
         )
 
-    print(f"\n=== 完成 [{dataset_name}] ===")
-    print(f"結果存在: {out_dir}/")
+    print(f"\n=== Completed [{dataset_name}] ===")
+    print(f"Results saved to: {out_dir}/")
 
-
-# ===========================================================
-# Main
-# ===========================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset',      type=str, default='sped',
@@ -279,17 +235,17 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir',   type=str, default='./viz_results')
     parser.add_argument('--max_samples',  type=int, default=20)
     parser.add_argument('--single_query', type=str, default=None,
-                        help='只跑單張，不需指定 --dataset')
+                        help='Only run a single query, no need to specify --dataset')
     parser.add_argument('--gpu',          type=int, default=0)
     args = parser.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    print(f"使用 GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
+    print(f"Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
 
-    print(f"載入 checkpoint：{CKPT_PATH}")
+    print(f"Loading checkpoint：{CKPT_PATH}")
     model = VPRModel.load_from_checkpoint(CKPT_PATH, strict=False)
     model.eval().cuda()
-    print("模型載入完成！\n")
+    print("Model loaded successfully!\n")
 
     if args.single_query:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -297,6 +253,6 @@ if __name__ == '__main__':
             model, args.single_query,
             save_path=f'{args.output_dir}/single_branches.png'
         )
-        print(f"結果存在 {args.output_dir}/single_branches.png")
+        print(f"Results saved to {args.output_dir}/single_branches.png")
     else:
         batch_visualize(model, args.dataset, args.output_dir, args.max_samples)
